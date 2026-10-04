@@ -1,0 +1,658 @@
+# face_tracker.py
+import os
+import re
+import cv2
+import numpy as np
+import threading
+import time
+from collections import deque
+import tkinter as tk
+from tkinter import simpledialog
+
+
+class PerformanceTracker:
+    """
+    O(1) Performance Tracker using fixed-capacity circular buffers (deques).
+    """
+    def __init__(self, buffer_size=30):
+        self.buffer_size = buffer_size
+        self._canvas = np.zeros((220, 380, 3), dtype=np.uint8)
+        self.reset()
+
+    def reset(self):
+        self.frame_times = deque(maxlen=self.buffer_size)
+        self.detect_latencies = deque(maxlen=self.buffer_size)
+        self.rec_latencies = deque(maxlen=self.buffer_size)
+
+    def tick(self):
+        return time.perf_counter()
+
+    def log_detection(self, duration_ms):
+        self.detect_latencies.append(duration_ms)
+
+    def log_recognition(self, duration_ms):
+        self.rec_latencies.append(duration_ms)
+
+    def end_frame(self, frame_start):
+        elapsed = time.perf_counter() - frame_start
+        self.frame_times.append(elapsed)
+
+    @property
+    def fps(self):
+        if not self.frame_times:
+            return 0.0
+        avg_time = sum(self.frame_times) / len(self.frame_times)
+        return 1.0 / avg_time if avg_time > 0 else 0.0
+
+    @property
+    def avg_detect_ms(self):
+        return sum(self.detect_latencies) / len(self.detect_latencies) if self.detect_latencies else 0.0
+
+    @property
+    def avg_rec_ms(self):
+        return sum(self.rec_latencies) / len(self.rec_latencies) if self.rec_latencies else 0.0
+
+    def render_dashboard(self):
+        canvas = self._canvas
+        canvas[:] = (20, 20, 20)
+
+        cv2.putText(canvas, "PERFORMANCE ANALYTICS", (15, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.line(canvas, (15, 42), (365, 42), (70, 70, 70), 1)
+
+        cv2.putText(canvas, f"Live FPS:              {self.fps:.1f}", (20, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Detection Latency:     {self.avg_detect_ms:.2f} ms", (20, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 200, 0), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Recognition Latency:   {self.avg_rec_ms:.2f} ms", (20, 160),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 165, 255), 1, cv2.LINE_AA)
+
+        cv2.putText(canvas, "[Press 's' to close dashboard]", (65, 200),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1, cv2.LINE_AA)
+
+        return canvas
+
+
+DETECTOR_MODEL = "face_detection_yunet_2023mar.onnx"
+RECOGNIZER_MODEL = "face_recognition_sface_2021dec.onnx"
+
+# FIX: Models are no longer created at import time (a missing .onnx file used to
+# crash on import). They are created by init_models(), called from main().
+detector = None
+recognizer = None
+
+# Global thread-safety primitives
+database_lock = threading.Lock()
+model_lock = threading.Lock()
+
+# In-memory face database
+known_embeddings = []
+known_metadata = []
+
+# Concurrency guards
+is_registering = False
+is_deleting = False
+
+
+def init_models():
+    """
+    Initialize the YuNet detector and SFace recognizer.
+    """
+    global detector, recognizer
+
+    for model_path in (DETECTOR_MODEL, RECOGNIZER_MODEL):
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+
+    # 1. Initialize YuNet Detector
+    detector = cv2.FaceDetectorYN.create(
+        model=DETECTOR_MODEL,
+        config="",
+        input_size=(320, 240),
+        score_threshold=0.85,
+        nms_threshold=0.3
+    )
+
+    # 2. Initialize SFace Recognition Engine
+    recognizer = cv2.FaceRecognizerSF.create(
+        model=RECOGNIZER_MODEL,
+        config=""
+    )
+
+
+def compute_iou(box_a, box_b):
+    """
+    Compute Intersection over Union (IoU) between two bounding boxes.
+    Used for lightweight face continuity tracking to detect face swaps.
+    """
+    x_a, y_a, w_a, h_a = box_a
+    x_b, y_b, w_b, h_b = box_b
+
+    x_left = max(x_a, x_b)
+    y_top = max(y_a, y_b)
+    x_right = min(x_a + w_a, x_b + w_b)
+    y_bottom = min(y_a + h_a, y_b + h_b)
+
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+
+    inter_area = (x_right - x_left) * (y_bottom - y_top)
+    box_a_area = w_a * h_a
+    box_b_area = w_b * h_b
+
+    return inter_area / float(box_a_area + box_b_area - inter_area + 1e-6)
+
+
+def sanitize_name(raw):
+    """
+    FIX: Make user-entered names safe for use in file names (no path
+    separators, dots or other special characters). Returns '' if nothing is left.
+    """
+    cleaned = re.sub(r"[^\w\s-]", "", raw.strip())
+    cleaned = re.sub(r"\s+", "_", cleaned).strip("_")
+    return cleaned[:64]
+
+
+def sanitize_id(raw):
+    """
+    FIX: IDs may only contain letters, digits and '-' (no underscores, so they
+    can never collide with the '_ID' file name separator). Returns '' if empty.
+    """
+    return re.sub(r"[^A-Za-z0-9-]", "", raw.strip())[:32]
+
+
+def parse_profile_name(base_name):
+    """
+    FIX: Split '<Name>_ID<id>' using the LAST '_ID' so names that themselves
+    contain '_ID' are parsed correctly. Names keep the casing they were saved with.
+    """
+    if "_ID" in base_name:
+        name, custom_id = base_name.rsplit("_ID", 1)
+        name = name.replace('_', ' ')
+    else:
+        name = base_name.replace('_', ' ')
+        custom_id = "N/A"
+    return name, custom_id
+
+
+def load_known_faces(known_faces_dir="known_faces", restore_size=None):
+    """
+    Loads saved faces from disk and extracts feature vectors.
+    """
+    global known_embeddings, known_metadata
+
+    embeddings_temp = []
+    metadata_temp = []
+
+    if not os.path.exists(known_faces_dir):
+        os.makedirs(known_faces_dir)
+        return
+
+    print("[*] Loading registered database vectors...")
+    for filename in os.listdir(known_faces_dir):
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+            base_name = os.path.splitext(filename)[0]
+
+            name, custom_id = parse_profile_name(base_name)
+
+            img_path = os.path.join(known_faces_dir, filename)
+            emb_path = os.path.join(known_faces_dir, base_name + ".npy")
+
+            feat = None
+
+            # FIX: Prefer the stored embedding (saved at registration time). The
+            # saved image is a 112x112 aligned crop, which the detector often
+            # fails to re-detect, so profiles used to be lost after a restart.
+            if os.path.isfile(emb_path):
+                try:
+                    feat = np.load(emb_path).astype(np.float32).reshape(1, -1)
+                    if feat.shape != (1, 128):
+                        feat = None
+                except (OSError, ValueError):
+                    feat = None
+
+            # Fallback for older profiles that have no .npy file
+            if feat is None:
+                img = cv2.imread(img_path)
+                if img is None:
+                    continue
+
+                h, w, _ = img.shape
+
+                with model_lock:
+                    detector.setInputSize((w, h))
+                    _, faces = detector.detect(img)
+
+                    if faces is not None and len(faces) > 0:
+                        aligned = recognizer.alignCrop(img, faces[0])
+                        feat = recognizer.feature(aligned)
+                    elif (w, h) == (112, 112):
+                        # Already an aligned crop: extract the feature directly
+                        feat = recognizer.feature(img)
+
+            if feat is not None:
+                embeddings_temp.append(feat)
+                metadata_temp.append({'name': name, 'id': custom_id})
+                print(f"[+] Loaded Profile: {name} [ID: {custom_id}]")
+
+    with database_lock:
+        known_embeddings = embeddings_temp
+        known_metadata = metadata_temp
+
+    if restore_size:
+        detector.setInputSize(restore_size)
+
+
+def ask_registration_details():
+    """
+    FIX: Runs on the MAIN thread (Tkinter is not thread-safe and crashes on
+    macOS when used from a worker thread). Returns (name_clean, id_clean) or None.
+    """
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+
+    name_in = simpledialog.askstring("Register New Face", "Enter Full Name:", parent=root)
+    id_in = simpledialog.askstring("Register New Face", "Enter Custom Attendance ID:", parent=root)
+    root.destroy()
+
+    if not name_in or not id_in:
+        print("[!] Cancelled: Fields cannot be blank.\n")
+        return None
+
+    name_clean = sanitize_name(name_in)
+    id_clean = sanitize_id(id_in)
+
+    if not name_clean or not id_clean:
+        print("[!] Cancelled: Name/ID contain no valid characters "
+              "(ID may only use letters, digits and '-').\n")
+        return None
+
+    # FIX: Reject duplicate IDs
+    with database_lock:
+        duplicate = any(meta['id'] == id_clean for meta in known_metadata)
+    if duplicate:
+        print(f"[!] Cancelled: ID '{id_clean}' is already registered.\n")
+        return None
+
+    return name_clean, id_clean
+
+
+def ask_delete_id():
+    """
+    FIX: Runs on the MAIN thread. Returns the ID to delete or None.
+    """
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+
+    id_in = simpledialog.askstring("Delete Face", "Enter the ID to remove:", parent=root)
+    root.destroy()
+
+    if not id_in or not id_in.strip():
+        print("[!] Deletion Cancelled.\n")
+        return None
+
+    return id_in.strip()
+
+
+def bg_registration_worker(frame_snapshot, target_face, known_faces_dir, name_clean, id_clean):
+    """
+    Background worker for face registration.
+    """
+    global is_registering
+
+    try:
+        base_name = f"{name_clean}_ID{id_clean}"
+        save_dest = os.path.join(known_faces_dir, base_name + ".jpg")
+        emb_dest = os.path.join(known_faces_dir, base_name + ".npy")
+
+        with model_lock:
+            aligned = recognizer.alignCrop(frame_snapshot, target_face)
+            feat = recognizer.feature(aligned)
+
+        cv2.imwrite(save_dest, aligned)
+        # FIX: Persist the embedding so the profile reloads reliably on restart
+        np.save(emb_dest, feat)
+        print(f"[+] Saved successfully to database: {save_dest}")
+
+        with database_lock:
+            known_embeddings.append(feat)
+            known_metadata.append({'name': name_clean.replace('_', ' '), 'id': id_clean})
+        print("[*] Database updated successfully!\n")
+    finally:
+        is_registering = False
+
+
+def bg_deletion_worker(known_faces_dir, id_in):
+    """
+    Background worker for face deletion.
+    """
+    global is_deleting
+
+    try:
+        deleted = False
+
+        for filename in os.listdir(known_faces_dir):
+            if not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.npy')):
+                continue
+
+            base, _ = os.path.splitext(filename)
+            _, file_id = parse_profile_name(base)
+
+            # FIX: exact ID match; removes the image AND its stored embedding
+            if file_id == id_in:
+                target_path = os.path.join(known_faces_dir, filename)
+                try:
+                    os.remove(target_path)
+                    print(f"[+] Removed Profile: {filename}")
+                    deleted = True
+                except OSError as e:
+                    print(f"[!] Could not remove {filename}: {e}")
+
+        if deleted:
+            with database_lock:
+                # FIX: remove every matching entry, not just the first
+                for i in range(len(known_metadata) - 1, -1, -1):
+                    if known_metadata[i]['id'] == id_in:
+                        known_embeddings.pop(i)
+                        known_metadata.pop(i)
+            print("[*] Database updated successfully!\n")
+        else:
+            print(f"[!] No profile found matching ID: {id_in}\n")
+    finally:
+        is_deleting = False
+
+
+def main():
+    global is_registering, is_deleting
+    known_faces_dir = "known_faces"
+
+    try:
+        init_models()
+    except (FileNotFoundError, cv2.error) as e:
+        print(f"[!] Error: Could not load models: {e}")
+        return
+
+    perf_tracker = PerformanceTracker(buffer_size=30)
+    show_stats = False
+
+    show_raw_feed = True
+    show_centered_feed = True
+
+    cap = cv2.VideoCapture(0)
+    # FIX: check the camera opened BEFORE configuring/reading it
+    if not cap.isOpened():
+        print("[!] Error: Camera initialization failed.")
+        return
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if w == 0 or h == 0:
+        w, h = 640, 480
+
+    load_known_faces(known_faces_dir, restore_size=(w, h))
+    detector.setInputSize((w, h))
+
+    print("\n==================✨WELCOME TO VIDEOTRACK✨=======================")
+    print(" CONTROLS:")
+    print("  Press '1' -> Toggle Raw Camera Feed (On/Off)")
+    print("  Press '2' -> Toggle Auto-Centered Camera Feed (On/Off)")
+    print("  Press 'b' -> Toggle Bounding Box visibility (On/Off)")
+    print("  Press 's' -> Open/Close Performance Stats Window")
+    print("  Press 'r' -> Register new face")
+    print("  Press 'd' -> Delete face by ID")
+    print("  Press 'q' -> Quit the program safely")
+    print("=================================================================\n")
+
+    MATCH_THRESHOLD = 0.36
+    show_box = True
+
+    smooth_cx, smooth_cy = float(w) / 2.0, float(h) / 2.0
+    alpha = 0.05
+    CROP_SIZE = 450
+
+    frame_counter = 0
+    display_text = "Unknown"
+    box_color = (0, 0, 255)
+    target_face = None
+
+    # --- STALE ID FIX: Face continuity tracking state ---
+    prev_face_box = None
+    force_recognition = False
+    IOU_THRESHOLD = 0.25  # Below this = different person or major re-entry
+
+    # FIX: try/finally so the camera and windows are always released
+    try:
+        while True:
+            if show_stats:
+                frame_start = perf_tracker.tick()
+
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            frame_counter += 1
+            frame = cv2.flip(frame, 1)
+            fh, fw, _ = frame.shape
+
+            # --- DETECTION PHASE ---
+            if show_stats:
+                t_det = time.perf_counter()
+                with model_lock:
+                    _, faces = detector.detect(frame)
+                perf_tracker.log_detection((time.perf_counter() - t_det) * 1000)
+            else:
+                with model_lock:
+                    _, faces = detector.detect(frame)
+
+            target_face = None
+            x = y = face_w = face_h = 0
+
+            if faces is not None and len(faces) > 0:
+                faces = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
+                target_face = faces[0]
+
+                x, y, face_w, face_h = target_face[0:4].astype(int)
+                face_cx = x + face_w // 2
+                face_cy = y + face_h // 2
+
+                # LERP Smoothing
+                smooth_cx += alpha * (face_cx - smooth_cx)
+                smooth_cy += alpha * (face_cy - smooth_cy)
+
+                # --- STALE ID FIX: Detect face swaps via IoU continuity ---
+                curr_box = (x, y, face_w, face_h)
+                face_swapped = False
+
+                if prev_face_box is None:
+                    face_swapped = True  # New face entered frame
+                else:
+                    iou_score = compute_iou(prev_face_box, curr_box)
+                    if iou_score < IOU_THRESHOLD:
+                        face_swapped = True  # Different person or major jump
+
+                if face_swapped:
+                    display_text = "Unknown"
+                    box_color = (0, 0, 255)
+                    force_recognition = True  # Bypass 15-frame stride immediately
+
+                prev_face_box = curr_box
+
+                # --- RECOGNITION PHASE (every 15 frames OR on forced swap) ---
+                if frame_counter % 15 == 0 or force_recognition:
+                    t_rec = time.perf_counter() if show_stats else None
+
+                    with model_lock:
+                        aligned_face = recognizer.alignCrop(frame, target_face)
+                        current_feat = recognizer.feature(aligned_face)
+
+                    with database_lock:
+                        embeddings_snapshot = known_embeddings.copy()
+                        metadata_snapshot = known_metadata.copy()
+
+                    best_score = -1.0
+                    best_idx = -1
+
+                    for idx, known_feat in enumerate(embeddings_snapshot):
+                        score = recognizer.match(current_feat, known_feat, 0)
+                        if score > best_score:
+                            best_score = score
+                            best_idx = idx
+
+                    if best_score >= MATCH_THRESHOLD and best_idx >= 0:
+                        meta = metadata_snapshot[best_idx]
+                        display_text = f"{meta['name']} | ID: {meta['id']}"
+                        box_color = (0, 255, 0)
+                    else:
+                        display_text = "Unknown"
+                        box_color = (0, 0, 255)
+
+                    force_recognition = False  # Consume the forced flag
+
+                    if show_stats and t_rec is not None:
+                        perf_tracker.log_recognition((time.perf_counter() - t_rec) * 1000)
+            else:
+                # Face lost: reset continuity and identity
+                prev_face_box = None
+                display_text = "Unknown"
+                box_color = (0, 0, 255)
+                target_face = None
+
+            # --- AUTO-CENTERED CROPPED WINDOW ---
+            if show_centered_feed:
+                # FIX: never let the crop exceed the frame (low-res cameras used
+                # to make this window silently disappear)
+                crop_size = min(CROP_SIZE, fw, fh)
+                crop_half = crop_size // 2
+
+                x1 = max(0, int(smooth_cx) - crop_half)
+                y1 = max(0, int(smooth_cy) - crop_half)
+
+                if x1 + crop_size > fw:
+                    x1 = fw - crop_size
+                if y1 + crop_size > fh:
+                    y1 = fh - crop_size
+                x1, y1 = max(0, x1), max(0, y1)
+
+                if x1 >= 0 and y1 >= 0 and (x1 + crop_size) <= fw and (y1 + crop_size) <= fh:
+                    cropped_view = frame[y1:y1 + crop_size, x1:x1 + crop_size].copy()
+
+                    if show_box and target_face is not None:
+                        cx_rel = x - x1
+                        cy_rel = y - y1
+                        cv2.rectangle(cropped_view, (cx_rel, cy_rel),
+                                      (cx_rel + face_w, cy_rel + face_h), box_color, 2)
+                        cv2.putText(cropped_view, display_text, (cx_rel, max(cy_rel - 10, 20)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1, cv2.LINE_AA)
+
+                    cv2.imshow("Live Auto-Centered Camera", cropped_view)
+
+            # --- RAW FEED OVERLAY ---
+            if show_raw_feed:
+                if show_box and target_face is not None:
+                    cv2.rectangle(frame, (x, y), (x + face_w, y + face_h), box_color, 2)
+                    cv2.putText(frame, display_text, (x, max(y - 10, 20)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1, cv2.LINE_AA)
+
+                cv2.imshow("Raw Camera Feed Overview", frame)
+
+            # --- STATS DASHBOARD ---
+            if show_stats:
+                perf_tracker.end_frame(frame_start)
+                cv2.imshow("Performance Analytics Dashboard", perf_tracker.render_dashboard())
+
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == ord('1'):
+                show_raw_feed = not show_raw_feed
+                if not show_raw_feed:
+                    try:
+                        cv2.destroyWindow("Raw Camera Feed Overview")
+                    except cv2.error:
+                        pass
+                print(f"[*] Raw Feed Window: {'ENABLED' if show_raw_feed else 'DISABLED'}")
+
+            elif key == ord('2'):
+                show_centered_feed = not show_centered_feed
+                if not show_centered_feed:
+                    try:
+                        cv2.destroyWindow("Live Auto-Centered Camera")
+                    except cv2.error:
+                        pass
+                print(f"[*] Auto-Centered Feed Window: {'ENABLED' if show_centered_feed else 'DISABLED'}")
+
+            elif key == ord('b'):
+                show_box = not show_box
+                print(f"[*] Visual Bounding Box Display: {'ENABLED' if show_box else 'DISABLED'}")
+
+            elif key == ord('s'):
+                show_stats = not show_stats
+                if show_stats:
+                    perf_tracker.reset()
+                    print("[*] Performance Dashboard: OPENED (Tracking active)")
+                else:
+                    try:
+                        cv2.destroyWindow("Performance Analytics Dashboard")
+                    except cv2.error:
+                        pass
+                    print("[*] Performance Dashboard: CLOSED (Zero tracking overhead)")
+
+            elif key == ord('r'):
+                if target_face is None:
+                    print("[!] Error: No face detected. Cannot register.")
+                elif is_registering:
+                    print("[!] Warning: Registration already in progress.")
+                else:
+                    is_registering = True
+                    frame_snapshot = frame.copy()
+                    face_snapshot = target_face.copy()
+
+                    # FIX: dialogs run on the main thread (the video pauses
+                    # briefly while the dialog is open)
+                    print("\n[!] REGISTRATION ACTIVE")
+                    details = ask_registration_details()
+
+                    if details is None:
+                        is_registering = False
+                    else:
+                        name_clean, id_clean = details
+                        reg_thread = threading.Thread(
+                            target=bg_registration_worker,
+                            args=(frame_snapshot, face_snapshot, known_faces_dir,
+                                  name_clean, id_clean),
+                            daemon=True
+                        )
+                        reg_thread.start()
+
+            elif key == ord('d'):
+                if is_deleting:
+                    print("[!] Warning: Deletion already in progress.")
+                else:
+                    is_deleting = True
+
+                    # FIX: dialog runs on the main thread
+                    id_to_delete = ask_delete_id()
+
+                    if id_to_delete is None:
+                        is_deleting = False
+                    else:
+                        del_thread = threading.Thread(
+                            target=bg_deletion_worker,
+                            args=(known_faces_dir, id_to_delete),
+                            daemon=True
+                        )
+                        del_thread.start()
+
+            elif key == ord('q'):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == '__main__':
+    main()
