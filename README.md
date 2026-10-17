@@ -6,9 +6,6 @@
 
 It leverages **YuNet** for ultra-fast face detection and **SFace** for 128-dimensional vector feature extraction, paired with a thread-safe architecture and smooth Linear Interpolation (LERP) camera tracking.
 
-### Demo of the auto-centering live feed:
-<img title="" src="file:///C:/Users/Ruhaan/Pictures/Recording%202026-08-14%20200742.gif" alt="Recording 2026-08-14 200742.gif" width="354">
-
 ---
 
 ## ✨ Key Features
